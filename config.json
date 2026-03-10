@@ -1,0 +1,11 @@
+{
+  "site_name": "SpecialistMD2",
+  "site_id": "specialistmdlcp.sharepoint.com,5cea9ecb-2954-4399-99f0-a8a066369706,9aa907ca-6c58-4323-a689-910f240080cd",
+  "library": "Documents",
+  "monitor_root": "/General/MSP Team/MSP Team Data/LCP Report Data",
+  "poll_interval_seconds": 60,
+  "s3_bucket": "finallcpreports",
+  "case_id_pattern": "^(\\d+)",
+  "dry_run": true,
+  "excluded_folders": []
+}

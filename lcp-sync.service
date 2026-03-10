@@ -1,0 +1,18 @@
+[Unit]
+Description=SharePoint LCP Real-Time Sync to S3 (finallcpreports)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/lcp_report
+ExecStart=/home/ec2-user/lcp_report/venv/bin/python lcp_sync.py
+Restart=always
+RestartSec=30
+StandardOutput=append:/home/ec2-user/lcp_report/logs/lcp_sync.log
+StandardError=append:/home/ec2-user/lcp_report/logs/lcp_sync.log
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
