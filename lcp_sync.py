@@ -6,17 +6,12 @@ import time
 import traceback
 import zipfile
 import signal
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from io import BytesIO
 
 import msal
 import boto3
 import requests
-import PyPDF2
-import tempfile
-import subprocess
-import glob
-import redshift_connector
 
 # =========================================================
 # CONFIG
@@ -278,43 +273,6 @@ def ensure_s3_folders(case_id):
     _created_case_folders.add(case_id)
 
 # =========================================================
-# PATIENT NAME LOOKUP (Redshift)
-# =========================================================
-
-_patient_name_cache = {}  # Cache: case_id -> patient name
-
-def lookup_patient_name(case_id):
-    """Look up patient full_name from Redshift by case_id. Returns 'Unknown' if not found."""
-    if case_id in _patient_name_cache:
-        return _patient_name_cache[case_id]
-
-    name = "Unknown"
-    try:
-        rs_cfg = secrets["redshift"]
-        conn = redshift_connector.connect(
-            host=rs_cfg["host"],
-            port=rs_cfg["port"],
-            database=rs_cfg["database"],
-            user=rs_cfg["user"],
-            password=rs_cfg["password"]
-        )
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT DISTINCT full_name FROM prod_pi_injury.stg_pi_injury.stg_lcp_pifirm_case_deals_info WHERE Case_ID = %s",
-            (int(case_id),)
-        )
-        row = cursor.fetchone()
-        if row and row[0]:
-            name = row[0].strip()
-        cursor.close()
-        conn.close()
-    except Exception as e:
-        log(f"  Redshift lookup failed for case_id={case_id}: {e}")
-
-    _patient_name_cache[case_id] = name
-    return name
-
-# =========================================================
 # S3 UPLOAD
 # =========================================================
 
@@ -331,53 +289,6 @@ def upload_bytes_to_s3(data_bytes, s3_key):
     time.sleep(THROTTLE_SECONDS)
 
 # =========================================================
-# PAGE COUNTING
-# =========================================================
-
-_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "tiff", "tif", "bmp", "gif"}
-
-def count_pages(file_bytes, filename):
-    """Count pages in a file. Returns 0 if unknown type."""
-    ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
-    try:
-        if ext == "pdf":
-            reader = PyPDF2.PdfReader(BytesIO(file_bytes))
-            return len(reader.pages)
-        if ext in ("docx", "doc"):
-            with tempfile.TemporaryDirectory() as tmpdir:
-                docx_path = os.path.join(tmpdir, filename)
-                with open(docx_path, "wb") as f:
-                    f.write(file_bytes)
-                # Use isolated user profile to prevent lock conflicts between conversions
-                profile_dir = os.path.join(tmpdir, "profile")
-                subprocess.run(
-                    ["/opt/libreoffice26.2/program/soffice", "--headless",
-                     f"-env:UserInstallation=file://{profile_dir}",
-                     "--convert-to", "pdf", "--outdir", tmpdir, docx_path],
-                    capture_output=True, timeout=120
-                )
-                pdf_files = glob.glob(os.path.join(tmpdir, "*.pdf"))
-                if pdf_files:
-                    with open(pdf_files[0], "rb") as pf:
-                        reader = PyPDF2.PdfReader(pf)
-                        return len(reader.pages)
-            return 1
-        if ext in _IMAGE_EXTENSIONS:
-            return 1
-    except Exception as e:
-        log(f"  Page count failed for {filename}: {e}")
-    return 0
-
-
-def download_and_upload(download_url, s3_key, filename):
-    """Download file to memory, count pages, upload to S3."""
-    resp = graph_get(download_url)
-    file_bytes = resp.content
-    pages = count_pages(file_bytes, filename)
-    upload_bytes_to_s3(file_bytes, s3_key)
-    return pages
-
-# =========================================================
 # ZIP FILE HANDLING
 # =========================================================
 
@@ -387,12 +298,10 @@ def handle_zip_file(download_url, case_id, rel_path, zip_filename):
     upload each to s3://finallcpreports/{case_id}/Input/{rel_path}/{extracted_path}.
     Preserves internal ZIP folder structure.
     Skips directories and __MACOSX artifacts.
-    Returns (uploaded_keys, total_pages).
     """
     resp = graph_get(download_url)
     zip_buffer = BytesIO(resp.content)
     uploaded = []
-    total_pages = 0
 
     base = f"{case_id}/Input"
     if rel_path:
@@ -411,7 +320,6 @@ def handle_zip_file(download_url, case_id, rel_path, zip_filename):
                 # Preserve ZIP internal folder structure
                 s3_key = f"{base}/{member}"
                 file_data = zf.read(member)
-                total_pages += count_pages(file_data, filename)
                 upload_bytes_to_s3(file_data, s3_key)
                 uploaded.append(s3_key)
                 log(f"  ZIP extracted: {zip_filename}/{member} -> {s3_key}")
@@ -421,23 +329,20 @@ def handle_zip_file(download_url, case_id, rel_path, zip_filename):
         upload_bytes_to_s3(resp.content, s3_key)
         uploaded.append(s3_key)
 
-    return uploaded, total_pages
+    return uploaded
 
 # =========================================================
 # EMAIL
 # =========================================================
 
-def send_email(subject, body, html=False):
-    """Send email via Microsoft Graph API. Set html=True for HTML body."""
+def send_email(subject, body):
+    """Send email via Microsoft Graph API."""
     email_cfg = secrets["email"]
 
     payload = {
         "message": {
             "subject": subject,
-            "body": {
-                "contentType": "HTML" if html else "Text",
-                "content": body
-            },
+            "body": {"contentType": "Text", "content": body},
             "toRecipients": [
                 {"emailAddress": {"address": r}}
                 for r in email_cfg["recipients"]
@@ -550,7 +455,7 @@ def poll_and_sync(drive_id):
             # Dry-run mode: log only
             if DRY_RUN:
                 log(f"  DRY-RUN: case_id={case_id} | {parent_path}/{filename} -> s3://{BUCKET}/{s3_key}")
-                synced_files.append({"s3_key": s3_key, "case_id": case_id, "pages": 0})
+                synced_files.append(f"{s3_key} ({size_mb} MB) [DRY-RUN]")
                 continue
 
             # Real upload
@@ -568,18 +473,15 @@ def poll_and_sync(drive_id):
                 # Check if ZIP file
                 if filename.lower().endswith(".zip"):
                     log(f"  ZIP detected: {filename} — extracting...")
-                    extracted, zip_pages = handle_zip_file(download_url, case_id, rel_path, filename)
+                    extracted = handle_zip_file(download_url, case_id, rel_path, filename)
                     for ek in extracted:
-                        synced_files.append({"s3_key": ek, "case_id": case_id, "pages": 0})
-                    # Assign total zip pages to the first entry
-                    if extracted:
-                        synced_files[-len(extracted)]["pages"] = zip_pages
-                    log(f"  ZIP done: {len(extracted)} files extracted, {zip_pages} pages from {filename}")
+                        synced_files.append(f"{ek} [from {filename}]")
+                    log(f"  ZIP done: {len(extracted)} files extracted from {filename}")
                 else:
-                    # Download, count pages, upload to S3
-                    pages = download_and_upload(download_url, s3_key, filename)
-                    synced_files.append({"s3_key": s3_key, "case_id": case_id, "pages": pages})
-                    log(f"  -> s3://{BUCKET}/{s3_key} ({pages} pages)")
+                    # Stream regular file to S3
+                    stream_to_s3(download_url, s3_key)
+                    synced_files.append(f"{s3_key} ({size_mb} MB)")
+                    log(f"  -> s3://{BUCKET}/{s3_key}")
 
             except Exception as e:
                 error_count += 1
@@ -599,155 +501,42 @@ def poll_and_sync(drive_id):
         save_state()
         log("First run complete — delta baseline consumed. No files uploaded.")
         log("Next poll cycle will process new files.")
-        return [], 0
+        return
 
     # Summary
     log(f"Poll complete: {len(synced_files)} synced, {skipped_count} skipped, {error_count} errors")
 
-    return synced_files, error_count
-
-
-DASHBOARD_URL = "http://100.24.25.37:3005/msp/ocr-reports"
-
-
-def _build_sync_html(synced_files, error_count):
-    """Build HTML email body for sync summary."""
-    # Aggregate per case folder
-    folder_stats = {}
-    for f in synced_files:
-        cid = f["case_id"]
-        if cid not in folder_stats:
-            folder_stats[cid] = {"files": 0, "pages": 0}
-        folder_stats[cid]["files"] += 1
-        folder_stats[cid]["pages"] += f["pages"]
-
-    total_files = len(synced_files)
-    total_pages = sum(s["pages"] for s in folder_stats.values())
-    num_cases = len(folder_stats)
-    est = timezone(timedelta(hours=-5))
-    ts = datetime.now(est).strftime("%Y-%m-%d %I:%M %p EST")
-    mode = "[DRY-RUN] " if DRY_RUN else ""
-
-    # Build folder rows
-    PAGE_WARN_THRESHOLD = 900
-    folder_rows = ""
-    has_any_ready = False
-    for cid, stats in sorted(folder_stats.items()):
-        over_limit = stats["pages"] > PAGE_WARN_THRESHOLD
-        if over_limit:
-            row_style = 'style="background:#fff9e6;"'
-            status_badge = (
-                '<span style="color:#b26a00;background:#fff4db;padding:4px 10px;'
-                'border-radius:4px;font-size:12px;font-weight:600;">'
-                '&#9888; Limit exceeded</span>'
-            )
-        else:
-            has_any_ready = True
-            row_style = ''
-            status_badge = (
-                '<span style="color:#1f7a3e;background:#e6f6ec;padding:4px 10px;'
-                'border-radius:4px;font-size:12px;font-weight:600;">'
-                'Ready</span>'
-            )
-        patient_name = lookup_patient_name(cid)
-        td = 'style="padding:10px 0;border-bottom:1px solid #f1f1f1;"'
-        folder_rows += (
-            f'<tr {row_style}>'
-            f'<td {td}>{cid}</td>'
-            f'<td {td}>{patient_name}</td>'
-            f'<td {td}>{stats["files"]}</td>'
-            f'<td {td}>{stats["pages"]}</td>'
-            f'<td {td}>{status_badge}</td></tr>'
-        )
-
-    error_block = ""
-    if error_count > 0:
-        error_block = (
-            '<div style="background:#fff4db;border-left:4px solid #b26a00;'
-            'padding:12px 16px;border-radius:4px;margin-bottom:20px;color:#b26a00;">'
-            f'&#9888; {error_count} error(s) occurred during sync. Check logs for details.</div>'
-        )
-
-    button_block = ""
-    if has_any_ready:
-        button_block = (
-            f'<div style="text-align:center;margin:25px 0 10px;">'
-            f'<a href="{DASHBOARD_URL}" '
-            f'style="background-color:#2f6fed;color:white;padding:12px 28px;'
-            f'text-decoration:none;border-radius:5px;font-size:15px;'
-            f'font-weight:600;display:inline-block;">'
-            f'Go to Dashboard</a></div>'
-        )
-
-    html = f"""
-    <div style="width:100%;padding:30px 0;background:#f4f6f8;font-family:Arial,Helvetica,sans-serif;">
-      <div style="width:600px;margin:auto;background:#ffffff;border-radius:8px;border:1px solid #e3e6ea;overflow:hidden;">
-
-        <div style="background:#2f6fed;color:white;padding:18px 25px;font-size:20px;font-weight:600;">
-          {mode}Case Files Ready for Processing
-        </div>
-
-        <div style="padding:25px;color:#333;">
-
-          <div style="background:#f1f4f8;padding:12px 16px;border-left:4px solid #2f6fed;border-radius:4px;margin-bottom:20px;color:#444;">
-            {num_cases} case folder(s) uploaded and ready for processing
-          </div>
-
-          <div style="font-weight:600;margin-bottom:10px;color:#222;">Summary</div>
-          <table style="width:100%;border-collapse:collapse;font-size:14px;margin-bottom:20px;">
-            <tr>
-              <td style="padding:10px 0;border-bottom:1px solid #f1f1f1;">Total Files</td>
-              <td style="padding:10px 0;border-bottom:1px solid #f1f1f1;">{total_files}</td>
-            </tr>
-            <tr>
-              <td style="padding:10px 0;border-bottom:1px solid #f1f1f1;">Total Pages</td>
-              <td style="padding:10px 0;border-bottom:1px solid #f1f1f1;">{total_pages}</td>
-            </tr>
-            <tr>
-              <td style="padding:10px 0;border-bottom:1px solid #f1f1f1;">Completed</td>
-              <td style="padding:10px 0;border-bottom:1px solid #f1f1f1;">{ts}</td>
-            </tr>
-          </table>
-
-          <div style="font-weight:600;margin-bottom:10px;color:#222;">Folders</div>
-          <table style="width:100%;border-collapse:collapse;font-size:14px;margin-bottom:20px;">
-            <tr>
-              <th style="text-align:left;padding:10px 0;border-bottom:2px solid #e5e5e5;color:#444;">Case ID</th>
-              <th style="text-align:left;padding:10px 0;border-bottom:2px solid #e5e5e5;color:#444;">Patient Name</th>
-              <th style="text-align:left;padding:10px 0;border-bottom:2px solid #e5e5e5;color:#444;">Files</th>
-              <th style="text-align:left;padding:10px 0;border-bottom:2px solid #e5e5e5;color:#444;">Pages</th>
-              <th style="text-align:left;padding:10px 0;border-bottom:2px solid #e5e5e5;color:#444;">Status</th>
-            </tr>
-            {folder_rows}
-          </table>
-
-          {error_block}
-          {button_block}
-
-        </div>
-
-        <div style="padding:15px 25px;font-size:12px;color:#888;background:#fafafa;">
-          Automated notification from AI Tech Processing System
-        </div>
-
-      </div>
-    </div>"""
-    return html
-
-
-def _send_sync_email(synced_files, error_count):
-    """Send a consolidated HTML email summarizing all accumulated sync results."""
+    # Only send email when files are actually synced (not on empty polls)
     if synced_files:
+        # Group files by case ID folder for a clean summary
+        folder_counts = {}
+        for f in synced_files:
+            case_id_part = f.split("/")[0]
+            folder_counts[case_id_part] = folder_counts.get(case_id_part, 0) + 1
+
         mode = "[DRY-RUN] " if DRY_RUN else ""
-        total_files = len(synced_files)
-        subject = f"{mode}Case Files Ready — {total_files} files processed"
-        html = _build_sync_html(synced_files, error_count)
+        subject = f"{mode}LCP Sync — {len(synced_files)} files synced"
+
+        folder_lines = "\n".join(
+            f"  {cid}/ — {cnt} file(s)" for cid, cnt in sorted(folder_counts.items())
+        )
+
+        body = "\n".join([
+            f"{mode}LCP Sync Summary",
+            f"Time (UTC): {datetime.now(timezone.utc).isoformat()}",
+            f"Total files synced: {len(synced_files)}",
+            "",
+            "Folders:",
+            folder_lines
+        ])
+
         try:
-            send_email(subject, html, html=True)
+            send_email(subject, body)
         except Exception as e:
             log(f"Failed to send summary email: {e}")
 
-    elif error_count > 0:
+    # Send error email only if errors occurred (separate from sync email)
+    if error_count > 0:
         try:
             send_email(
                 "LCP Sync — Error Alert",
@@ -798,31 +587,9 @@ if __name__ == "__main__":
         )
         sys.exit(1)
 
-    pending_files = []    # Accumulated sync results across poll cycles
-    pending_errors = 0    # Accumulated error count
-
     while RUNNING:
         try:
-            synced, errors = poll_and_sync(drive_id)
-            pending_errors += errors
-
-            if synced:
-                # Files found — accumulate, deduplicate by s3_key
-                existing_keys = {f["s3_key"] for f in pending_files}
-                new_count = 0
-                for f in synced:
-                    if f["s3_key"] not in existing_keys:
-                        pending_files.append(f)
-                        existing_keys.add(f["s3_key"])
-                        new_count += 1
-                log(f"Accumulated {new_count} new files (total pending: {len(pending_files)})")
-            elif pending_files:
-                # No new files AND we have accumulated files — send consolidated email now
-                log(f"Quiet poll detected. Sending consolidated email for {len(pending_files)} files...")
-                _send_sync_email(pending_files, pending_errors)
-                pending_files = []
-                pending_errors = 0
-
+            poll_and_sync(drive_id)
         except Exception as e:
             log(f"Poll cycle crashed: {e}")
             log(traceback.format_exc())
@@ -841,10 +608,5 @@ if __name__ == "__main__":
                 if not RUNNING:
                     break
                 time.sleep(1)
-
-    # Send any pending email before shutdown (don't lose sync results)
-    if pending_files:
-        log(f"Sending pending email before shutdown ({len(pending_files)} files)...")
-        _send_sync_email(pending_files, pending_errors)
 
     log("LCP Sync Daemon stopped.")
