@@ -17,6 +17,7 @@ import tempfile
 import subprocess
 import glob
 import redshift_connector
+import snowflake.connector
 
 # =========================================================
 # CONFIG
@@ -278,17 +279,13 @@ def ensure_s3_folders(case_id):
     _created_case_folders.add(case_id)
 
 # =========================================================
-# PATIENT NAME LOOKUP (Redshift)
+# PATIENT NAME LOOKUP (Redshift → Snowflake fallback)
 # =========================================================
 
-_patient_name_cache = {}  # Cache: case_id -> patient name
+_patient_name_cache = {}  # Cache: case_id -> (name, source)
 
-def lookup_patient_name(case_id):
-    """Look up patient full_name from Redshift by case_id. Returns 'Unknown' if not found."""
-    if case_id in _patient_name_cache:
-        return _patient_name_cache[case_id]
-
-    name = "Unknown"
+def _lookup_redshift(case_id):
+    """Query Redshift for patient name. Returns name or None."""
     try:
         rs_cfg = secrets["redshift"]
         conn = redshift_connector.connect(
@@ -304,15 +301,73 @@ def lookup_patient_name(case_id):
             (int(case_id),)
         )
         row = cursor.fetchone()
-        if row and row[0]:
-            name = row[0].strip()
         cursor.close()
         conn.close()
+        if row and row[0] and row[0].strip():
+            return row[0].strip()
     except Exception as e:
         log(f"  Redshift lookup failed for case_id={case_id}: {e}")
+    return None
 
-    _patient_name_cache[case_id] = name
-    return name
+def _lookup_snowflake(case_id):
+    """Query Snowflake for patient name. Returns name or None."""
+    try:
+        sf_cfg = secrets["snowflake"]
+        conn = snowflake.connector.connect(
+            account=sf_cfg["account"],
+            user=sf_cfg["user"],
+            password=sf_cfg["password"],
+            warehouse=sf_cfg["warehouse"],
+            database=sf_cfg["database"],
+            schema=sf_cfg["schema"]
+        )
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT DISTINCT FULL_NAME FROM PROD_PI_INJURY.STG_PI_INJURY.STG_LCP_PIFIRM_CASE_DEALS_INFO WHERE CASE_ID = %s",
+            (int(case_id),)
+        )
+        row = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        if row and row[0] and row[0].strip():
+            return row[0].strip()
+    except Exception as e:
+        log(f"  Snowflake lookup failed for case_id={case_id}: {e}")
+    return None
+
+def lookup_patient_name(case_id):
+    """
+    Look up patient name: try Redshift first, fallback to Snowflake.
+    Returns (name, source) tuple. source is 'Redshift', 'Snowflake', or None.
+    """
+    if case_id in _patient_name_cache:
+        return _patient_name_cache[case_id]
+
+    name = _lookup_redshift(case_id)
+    if name:
+        result = (name, "Redshift")
+    else:
+        name = _lookup_snowflake(case_id)
+        if name:
+            result = (name, "Snowflake")
+        else:
+            result = ("Unknown", None)
+
+    _patient_name_cache[case_id] = result
+    return result
+
+# =========================================================
+# S3 DEDUPLICATION
+# =========================================================
+
+def s3_file_exists(s3_key, expected_size):
+    """Check if a file with the same key and size already exists on S3."""
+    try:
+        resp = s3.head_object(Bucket=BUCKET, Key=s3_key)
+        existing_size = resp.get("ContentLength", -1)
+        return existing_size == expected_size
+    except Exception:
+        return False
 
 # =========================================================
 # S3 UPLOAD
@@ -343,27 +398,6 @@ def count_pages(file_bytes, filename):
         if ext == "pdf":
             reader = PyPDF2.PdfReader(BytesIO(file_bytes))
             return len(reader.pages)
-        if ext in ("docx", "doc"):
-            with tempfile.TemporaryDirectory() as tmpdir:
-                docx_path = os.path.join(tmpdir, filename)
-                with open(docx_path, "wb") as f:
-                    f.write(file_bytes)
-                # Use isolated user profile to prevent lock conflicts between conversions
-                profile_dir = os.path.join(tmpdir, "profile")
-                subprocess.run(
-                    ["/opt/libreoffice26.2/program/soffice", "--headless",
-                     f"-env:UserInstallation=file://{profile_dir}",
-                     "--convert-to", "pdf", "--outdir", tmpdir, docx_path],
-                    capture_output=True, timeout=120
-                )
-                pdf_files = glob.glob(os.path.join(tmpdir, "*.pdf"))
-                if pdf_files:
-                    with open(pdf_files[0], "rb") as pf:
-                        reader = PyPDF2.PdfReader(pf)
-                        return len(reader.pages)
-            return 1
-        if ext in _IMAGE_EXTENSIONS:
-            return 1
     except Exception as e:
         log(f"  Page count failed for {filename}: {e}")
     return 0
@@ -411,6 +445,10 @@ def handle_zip_file(download_url, case_id, rel_path, zip_filename):
                 # Preserve ZIP internal folder structure
                 s3_key = f"{base}/{member}"
                 file_data = zf.read(member)
+                # Dedup: skip if same file (name + size) already on S3
+                if s3_file_exists(s3_key, len(file_data)):
+                    log(f"  ZIP skip (duplicate): {member} already exists on S3 with same size")
+                    continue
                 total_pages += count_pages(file_data, filename)
                 upload_bytes_to_s3(file_data, s3_key)
                 uploaded.append(s3_key)
@@ -535,6 +573,7 @@ def poll_and_sync(drive_id):
             filename = item.get("name", "")
             file_size = item.get("size", 0)
             size_mb = round(file_size / (1024 * 1024), 2)
+            uploaded_by = item.get("lastModifiedBy", {}).get("user", {}).get("displayName", "Unknown")
 
             if not case_id:
                 skipped_count += 1
@@ -550,11 +589,17 @@ def poll_and_sync(drive_id):
             # Dry-run mode: log only
             if DRY_RUN:
                 log(f"  DRY-RUN: case_id={case_id} | {parent_path}/{filename} -> s3://{BUCKET}/{s3_key}")
-                synced_files.append({"s3_key": s3_key, "case_id": case_id, "pages": 0})
+                synced_files.append({"s3_key": s3_key, "case_id": case_id, "pages": 0, "uploaded_by": uploaded_by})
                 continue
 
             # Real upload
             try:
+                # Dedup: skip if same file (name + size) already exists on S3
+                if not filename.lower().endswith(".zip") and s3_file_exists(s3_key, file_size):
+                    skipped_count += 1
+                    log(f"  SKIP (duplicate): {filename} ({size_mb} MB) already exists on S3 with same size")
+                    continue
+
                 log(f"  SYNC: case_id={case_id} | {filename} ({size_mb} MB)")
 
                 # Ensure Input/Output/GroundTruth folders exist
@@ -570,7 +615,7 @@ def poll_and_sync(drive_id):
                     log(f"  ZIP detected: {filename} — extracting...")
                     extracted, zip_pages = handle_zip_file(download_url, case_id, rel_path, filename)
                     for ek in extracted:
-                        synced_files.append({"s3_key": ek, "case_id": case_id, "pages": 0})
+                        synced_files.append({"s3_key": ek, "case_id": case_id, "pages": 0, "uploaded_by": uploaded_by})
                     # Assign total zip pages to the first entry
                     if extracted:
                         synced_files[-len(extracted)]["pages"] = zip_pages
@@ -578,7 +623,7 @@ def poll_and_sync(drive_id):
                 else:
                     # Download, count pages, upload to S3
                     pages = download_and_upload(download_url, s3_key, filename)
-                    synced_files.append({"s3_key": s3_key, "case_id": case_id, "pages": pages})
+                    synced_files.append({"s3_key": s3_key, "case_id": case_id, "pages": pages, "uploaded_by": uploaded_by})
                     log(f"  -> s3://{BUCKET}/{s3_key} ({pages} pages)")
 
             except Exception as e:
@@ -617,7 +662,7 @@ def _build_sync_html(synced_files, error_count):
     for f in synced_files:
         cid = f["case_id"]
         if cid not in folder_stats:
-            folder_stats[cid] = {"files": 0, "pages": 0}
+            folder_stats[cid] = {"files": 0, "pages": 0, "uploaded_by": f.get("uploaded_by", "Unknown")}
         folder_stats[cid]["files"] += 1
         folder_stats[cid]["pages"] += f["pages"]
 
@@ -629,7 +674,7 @@ def _build_sync_html(synced_files, error_count):
     mode = "[DRY-RUN] " if DRY_RUN else ""
 
     # Build folder rows
-    PAGE_WARN_THRESHOLD = 900
+    PAGE_WARN_THRESHOLD = 1000
     folder_rows = ""
     has_any_ready = False
     for cid, stats in sorted(folder_stats.items()):
@@ -639,7 +684,7 @@ def _build_sync_html(synced_files, error_count):
             status_badge = (
                 '<span style="color:#b26a00;background:#fff4db;padding:4px 10px;'
                 'border-radius:4px;font-size:12px;font-weight:600;">'
-                '&#9888; Limit exceeded</span>'
+                '&#9888; Page Limit Exceeded</span>'
             )
         else:
             has_any_ready = True
@@ -649,12 +694,20 @@ def _build_sync_html(synced_files, error_count):
                 'border-radius:4px;font-size:12px;font-weight:600;">'
                 'Ready</span>'
             )
-        patient_name = lookup_patient_name(cid)
+        patient_name, name_source = lookup_patient_name(cid)
+        source_badge = ""
+        if name_source:
+            source_badge = (
+                f' <span title="{name_source}" style="display:inline-block;width:13px;height:13px;'
+                f'background:#ccc;color:#666;border-radius:50%;text-align:center;font-size:9px;'
+                f'line-height:13px;font-weight:600;cursor:help;vertical-align:middle;">i</span>'
+            )
         td = 'style="padding:10px 0;border-bottom:1px solid #f1f1f1;"'
         folder_rows += (
             f'<tr {row_style}>'
             f'<td {td}>{cid}</td>'
-            f'<td {td}>{patient_name}</td>'
+            f'<td {td}>{patient_name}{source_badge}</td>'
+            f'<td {td}>{stats["uploaded_by"]}</td>'
             f'<td {td}>{stats["files"]}</td>'
             f'<td {td}>{stats["pages"]}</td>'
             f'<td {td}>{status_badge}</td></tr>'
@@ -714,6 +767,7 @@ def _build_sync_html(synced_files, error_count):
             <tr>
               <th style="text-align:left;padding:10px 0;border-bottom:2px solid #e5e5e5;color:#444;">Case ID</th>
               <th style="text-align:left;padding:10px 0;border-bottom:2px solid #e5e5e5;color:#444;">Patient Name</th>
+              <th style="text-align:left;padding:10px 0;border-bottom:2px solid #e5e5e5;color:#444;">Uploaded By</th>
               <th style="text-align:left;padding:10px 0;border-bottom:2px solid #e5e5e5;color:#444;">Files</th>
               <th style="text-align:left;padding:10px 0;border-bottom:2px solid #e5e5e5;color:#444;">Pages</th>
               <th style="text-align:left;padding:10px 0;border-bottom:2px solid #e5e5e5;color:#444;">Status</th>
